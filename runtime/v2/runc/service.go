@@ -110,7 +110,7 @@ type service struct {
 	cancel func()
 }
 
-func newCommand(ctx context.Context, containerdBinary, containerdAddress string) (*exec.Cmd, error) {
+func newCommand(ctx context.Context, id, containerdBinary, containerdAddress string) (*exec.Cmd, error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
 		return nil, err
@@ -125,6 +125,7 @@ func newCommand(ctx context.Context, containerdBinary, containerdAddress string)
 	}
 	args := []string{
 		"-namespace", ns,
+		"-id", id,
 		"-address", containerdAddress,
 		"-publish-binary", containerdBinary,
 	}
@@ -138,7 +139,7 @@ func newCommand(ctx context.Context, containerdBinary, containerdAddress string)
 }
 
 func (s *service) StartShim(ctx context.Context, id, containerdBinary, containerdAddress string) (string, error) {
-	cmd, err := newCommand(ctx, containerdBinary, containerdAddress)
+	cmd, err := newCommand(ctx, id, containerdBinary, containerdAddress)
 	if err != nil {
 		return "", err
 	}
@@ -561,6 +562,7 @@ func (s *service) Checkpoint(ctx context.Context, r *taskAPI.CheckpointTaskReque
 		AllowTerminal:            opts.Terminal,
 		FileLocks:                opts.FileLocks,
 		EmptyNamespaces:          opts.EmptyNamespaces,
+		WorkDir:                  opts.WorkPath,
 	}); err != nil {
 		return nil, errdefs.ToGRPC(err)
 	}
@@ -692,6 +694,8 @@ func shouldKillAllOnExit(bundlePath string) (bool, error) {
 func (s *service) allProcesses() (o []rproc.Process) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	o = make([]rproc.Process, 0, len(s.processes)+1)
 	for _, p := range s.processes {
 		o = append(o, p)
 	}
@@ -803,5 +807,11 @@ func newInit(ctx context.Context, path, workDir, namespace string, platform rpro
 	p.IoGID = int(options.IoGid)
 	p.NoPivotRoot = options.NoPivotRoot
 	p.NoNewKeyring = options.NoNewKeyring
+	p.CriuWorkPath = options.CriuWorkPath
+	if p.CriuWorkPath == "" {
+		// if criu work path not set, use container WorkDir
+		p.CriuWorkPath = p.WorkDir
+	}
+
 	return p, nil
 }

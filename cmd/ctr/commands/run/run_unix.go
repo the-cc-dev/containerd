@@ -27,10 +27,12 @@ import (
 	"github.com/containerd/containerd/cmd/ctr/commands"
 	"github.com/containerd/containerd/contrib/nvidia"
 	"github.com/containerd/containerd/oci"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
 )
+
+var platformRunFlags []cli.Flag
 
 // NewContainer creates a new container
 func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli.Context) (containerd.Container, error) {
@@ -44,20 +46,13 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 		id = context.Args().Get(1)
 	}
 
-	if raw := context.String("checkpoint"); raw != "" {
-		im, err := client.GetImage(ctx, raw)
-		if err != nil {
-			return nil, err
-		}
-		return client.NewContainer(ctx, id, containerd.WithCheckpoint(im, id), containerd.WithRuntime(context.String("runtime"), nil))
-	}
-
 	var (
 		opts  []oci.SpecOpts
 		cOpts []containerd.NewContainerOpts
 		spec  containerd.NewContainerOpts
 	)
 
+	cOpts = append(cOpts, containerd.WithContainerLabels(commands.LabelArgs(context.StringSlice("label"))))
 	if config {
 		opts = append(opts, oci.WithSpecFromFile(context.String("config")))
 	} else {
@@ -98,7 +93,8 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 				// Even when "readonly" is set, we don't use KindView snapshot here. (#1495)
 				// We pass writable snapshot to the OCI runtime, and the runtime remounts it as read-only,
 				// after creating some mount points on demand.
-				containerd.WithNewSnapshot(id, image))
+				containerd.WithNewSnapshot(id, image),
+				containerd.WithImageStopSignal(image, "SIGTERM"))
 		}
 		if context.Bool("readonly") {
 			opts = append(opts, oci.WithRootFSReadonly())
@@ -136,9 +132,19 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 		if context.IsSet("gpus") {
 			opts = append(opts, nvidia.WithGPUs(nvidia.WithDevices(context.Int("gpus")), nvidia.WithAllCapabilities))
 		}
+		if context.IsSet("allow-new-privs") {
+			opts = append(opts, oci.WithNewPrivileges)
+		}
+		if context.IsSet("cgroup") {
+			// NOTE: can be set to "" explicitly for disabling cgroup.
+			opts = append(opts, oci.WithCgroup(context.String("cgroup")))
+		}
+		limit := context.Uint64("memory-limit")
+		if limit != 0 {
+			opts = append(opts, oci.WithMemoryLimit(limit))
+		}
 	}
 
-	cOpts = append(cOpts, containerd.WithContainerLabels(commands.LabelArgs(context.StringSlice("label"))))
 	cOpts = append(cOpts, containerd.WithRuntime(context.String("runtime"), nil))
 
 	var s specs.Spec
@@ -146,9 +152,8 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 
 	cOpts = append(cOpts, spec)
 
-	// oci.WithImageConfig (WithUsername, WithUserID) depends on rootfs snapshot for resolving /etc/passwd.
-	// So cOpts needs to have precedence over opts.
-	// TODO: WithUsername, WithUserID should additionally support non-snapshot rootfs
+	// oci.WithImageConfig (WithUsername, WithUserID) depends on access to rootfs for resolving via
+	// the /etc/{passwd,group} files. So cOpts needs to have precedence over opts.
 	return client.NewContainer(ctx, id, cOpts...)
 }
 

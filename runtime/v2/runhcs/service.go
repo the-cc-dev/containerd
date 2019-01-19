@@ -22,6 +22,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"net"
 	"os"
 	"os/exec"
 	"path"
@@ -29,9 +32,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	"github.com/Microsoft/hcsshim/cmd/go-runhcs"
+	winio "github.com/Microsoft/go-winio"
+	"github.com/Microsoft/hcsshim/pkg/go-runhcs"
 	containerd_types "github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/errdefs"
@@ -39,9 +44,11 @@ import (
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
+	"github.com/containerd/containerd/runtime/v2/runhcs/options"
 	"github.com/containerd/containerd/runtime/v2/shim"
 	taskAPI "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/go-runc"
+	"github.com/containerd/typeurl"
 	ptypes "github.com/gogo/protobuf/types"
 	oci "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
@@ -49,25 +56,74 @@ import (
 )
 
 const (
-	runhcsBinary      = "runhcs"
-	runhcsVersion     = "0.0.1"
-	runhcsDebugLegacy = "--debug" // TODO: JTERRY75 remove when all cmd's are complete in go-runhcs
+	runhcsShimVersion = "0.0.1"
+	safePipePrefix    = `\\.\pipe\ProtectedPrefix\Administrators\`
+
+	errorConnectionAborted syscall.Errno = 1236
 )
 
 var (
 	empty = &ptypes.Empty{}
 )
 
-func newRunhcs(bundle string) *runhcs.Runhcs {
-	rhs := &runhcs.Runhcs{
-		Debug:     logrus.GetLevel() == logrus.DebugLevel,
-		LogFormat: runhcs.JSON,
-		Owner:     "containerd-runhcs-shim-v1",
+// forwardRunhcsLogs copies logs from c and writes them to the ctx logger
+// upstream.
+func forwardRunhcsLogs(ctx context.Context, c net.Conn, fields logrus.Fields) {
+	defer c.Close()
+	j := json.NewDecoder(c)
+
+	for {
+		e := logrus.Entry{}
+		err := j.Decode(&e.Data)
+		if err == io.EOF || err == errorConnectionAborted {
+			break
+		}
+		if err != nil {
+			// Likely the last message wasn't complete at closure. Just read all
+			// data and forward as error.
+			data, _ := ioutil.ReadAll(io.MultiReader(j.Buffered(), c))
+			if len(data) != 0 {
+				log.G(ctx).WithFields(fields).Error(string(data))
+			}
+			break
+		}
+
+		msg := e.Data[logrus.FieldKeyMsg]
+		delete(e.Data, logrus.FieldKeyMsg)
+
+		level, err := logrus.ParseLevel(e.Data[logrus.FieldKeyLevel].(string))
+		if err != nil {
+			log.G(ctx).WithFields(fields).WithError(err).Debug("invalid log level")
+			level = logrus.DebugLevel
+		}
+		delete(e.Data, logrus.FieldKeyLevel)
+
+		// TODO: JTERRY75 maybe we need to make this configurable so we know
+		// that runhcs is using the same one we are deserializing.
+		ti, err := time.Parse(time.RFC3339, e.Data[logrus.FieldKeyTime].(string))
+		if err != nil {
+			log.G(ctx).WithFields(fields).WithError(err).Debug("invalid time stamp format")
+			ti = time.Time{}
+		}
+		delete(e.Data, logrus.FieldKeyTime)
+
+		etr := log.G(ctx).WithFields(fields).WithFields(e.Data)
+		etr.Time = ti
+		switch level {
+		case logrus.PanicLevel:
+			etr.Panic(msg)
+		case logrus.FatalLevel:
+			etr.Fatal(msg)
+		case logrus.ErrorLevel:
+			etr.Error(msg)
+		case logrus.WarnLevel:
+			etr.Warn(msg)
+		case logrus.InfoLevel:
+			etr.Info(msg)
+		case logrus.DebugLevel:
+			etr.Debug(msg)
+		}
 	}
-	if rhs.Debug {
-		rhs.Log = filepath.Join(bundle, "runhcs-debug.log")
-	}
-	return rhs
 }
 
 // New returns a new runhcs shim service that can be used via GRPC
@@ -89,10 +145,29 @@ type service struct {
 
 	context context.Context
 
+	// debugLog if not "" indicates the log file or pipe path for runhcs.exe to
+	// write its logs to.
+	debugLog string
+	// if `shimOpts.DebugType == options.Opitons_NPIPE` will hold the listener
+	// for the runhcs.exe to connect to for sending logs.
+	debugListener net.Listener
+
+	shimOpts options.Options
+
 	id        string
 	processes map[string]*process
 
 	publisher events.Publisher
+}
+
+func (s *service) newRunhcs() *runhcs.Runhcs {
+	return &runhcs.Runhcs{
+		Debug:     s.shimOpts.Debug,
+		Log:       s.debugLog,
+		LogFormat: runhcs.JSON,
+		Owner:     "containerd-runhcs-shim-v1",
+		Root:      s.shimOpts.RegistryRoot,
+	}
 }
 
 // getProcess attempts to get a process by id.
@@ -126,13 +201,22 @@ func (s *service) Cleanup(ctx context.Context) (*taskAPI.DeleteResponse, error) 
 	if err != nil {
 		return nil, err
 	}
-	path, err := os.Getwd()
-	if err != nil {
-		return nil, err
+	// Forcibly shut down any container in this bundle
+	rhcs := s.newRunhcs()
+	dopts := &runhcs.DeleteOpts{
+		Force: true,
 	}
-	if err := os.RemoveAll(path); err != nil {
-		return nil, err
+	if err := rhcs.Delete(ctx, s.id, dopts); err != nil {
+		log.G(ctx).WithError(err).Debugf("failed to delete container")
 	}
+
+	opts, ok := ctx.Value(shim.OptsKey{}).(shim.Opts)
+	if ok && opts.BundlePath != "" {
+		if err := os.RemoveAll(opts.BundlePath); err != nil {
+			return nil, err
+		}
+	}
+
 	return &taskAPI.DeleteResponse{
 		ExitedAt:   time.Now(),
 		ExitStatus: 255,
@@ -162,8 +246,13 @@ func (s *service) StartShim(ctx context.Context, id, containerdBinary, container
 		"-address", containerdAddress,
 		"-publish-binary", containerdBinary,
 		"-socket", socketAddress,
-		"-debug",
 	}
+
+	opts, ok := ctx.Value(shim.OptsKey{}).(shim.Opts)
+	if ok && opts.Debug {
+		args = append(args, "-debug")
+	}
+
 	cmd := exec.Command(self, args...)
 	cmd.Dir = cwd
 	cmd.Env = append(os.Environ(), "GOMAXPROCS=2")
@@ -192,6 +281,8 @@ func (s *service) StartShim(ctx context.Context, id, containerdBinary, container
 
 // State returns runtime state information for a process
 func (s *service) State(ctx context.Context, r *taskAPI.StateRequest) (*taskAPI.StateResponse, error) {
+	log.G(ctx).Debugf("State: %s: %s", r.ID, r.ExecID)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -201,46 +292,26 @@ func (s *service) State(ctx context.Context, r *taskAPI.StateRequest) (*taskAPI.
 		return nil, err
 	}
 
-	cmd := exec.Command(runhcsBinary, runhcsDebugLegacy, "state", p.id)
-	sout := getBuffer()
-	defer putBuffer(sout)
+	var tstatus string
 
-	cmd.Stdout = sout
-	_, stateErr := runCmd(ctx, cmd)
-	if stateErr != nil {
-		return nil, stateErr
-	}
-
-	// TODO: JTERRY75 merge this with runhcs declaration
-	type containerState struct {
-		// Version is the OCI version for the container
-		Version string `json:"ociVersion"`
-		// ID is the container ID
-		ID string `json:"id"`
-		// InitProcessPid is the init process id in the parent namespace
-		InitProcessPid int `json:"pid"`
-		// Status is the current status of the container, running, paused, ...
-		Status string `json:"status"`
-		// Bundle is the path on the filesystem to the bundle
-		Bundle string `json:"bundle"`
-		// Rootfs is a path to a directory containing the container's root filesystem.
-		Rootfs string `json:"rootfs"`
-		// Created is the unix timestamp for the creation time of the container in UTC
-		Created time.Time `json:"created"`
-		// Annotations is the user defined annotations added to the config.
-		Annotations map[string]string `json:"annotations,omitempty"`
-		// The owner of the state directory (the owner of the container).
-		Owner string `json:"owner"`
-	}
-
-	var cs containerState
-	if err := json.NewDecoder(sout).Decode(&cs); err != nil {
-		log.G(ctx).WithError(err).Debugf("failed to decode runhcs state output: %s", sout.Bytes())
-		return nil, err
+	// This is a container
+	if p.cid == p.id {
+		rhcs := s.newRunhcs()
+		cs, err := rhcs.State(ctx, p.id)
+		if err != nil {
+			return nil, err
+		}
+		tstatus = cs.Status
+	} else {
+		if p.started {
+			tstatus = "running"
+		} else {
+			tstatus = "created"
+		}
 	}
 
 	status := task.StatusUnknown
-	switch cs.Status {
+	switch tstatus {
 	case "created":
 		status = task.StatusCreated
 	case "running":
@@ -253,8 +324,8 @@ func (s *service) State(ctx context.Context, r *taskAPI.StateRequest) (*taskAPI.
 	pe := p.stat()
 	return &taskAPI.StateResponse{
 		ID:         p.id,
-		Bundle:     cs.Bundle,
-		Pid:        uint32(cs.InitProcessPid),
+		Bundle:     p.bundle,
+		Pid:        pe.pid,
 		Status:     status,
 		Stdin:      p.stdin,
 		Stdout:     p.stdout,
@@ -266,7 +337,25 @@ func (s *service) State(ctx context.Context, r *taskAPI.StateRequest) (*taskAPI.
 }
 
 func writeMountsToConfig(bundle string, mounts []*containerd_types.Mount) error {
-	if len(mounts) != 1 {
+	cf, err := os.OpenFile(path.Join(bundle, "config.json"), os.O_RDWR, 0)
+	if err != nil {
+		return errors.Wrap(err, "bundle does not contain config.json")
+	}
+	defer cf.Close()
+	var spec oci.Spec
+	if err := json.NewDecoder(cf).Decode(&spec); err != nil {
+		return errors.Wrap(err, "bundle config.json is not valid oci spec")
+	}
+
+	if len(mounts) == 0 {
+		// If no mounts are passed via the snapshotter its the callers full
+		// responsibility to manage the storage. Just move on without affecting
+		// the config.json at all.
+		if spec.Windows == nil || len(spec.Windows.LayerFolders) < 2 {
+			return errors.New("no Windows.LayerFolders found in oci spec")
+		}
+		return nil
+	} else if len(mounts) != 1 {
 		return errors.New("Rootfs does not contain exactly 1 mount for the root file system")
 	}
 
@@ -296,29 +385,19 @@ func writeMountsToConfig(bundle string, mounts []*containerd_types.Mount) error 
 			opp := len(parentLayerPaths) - 1 - i
 			parentLayerPaths[i], parentLayerPaths[opp] = parentLayerPaths[opp], parentLayerPaths[i]
 		}
-	}
 
-	cf, err := os.OpenFile(path.Join(bundle, "config.json"), os.O_RDWR, 0)
-	if err != nil {
-		return errors.Wrap(err, "bundle does not contain config.json")
-	}
-	defer cf.Close()
-	var spec oci.Spec
-	if err := json.NewDecoder(cf).Decode(&spec); err != nil {
-		return errors.Wrap(err, "bundle config.json is not valid oci spec")
-	}
-	if err := cf.Truncate(0); err != nil {
-		return errors.Wrap(err, "failed to truncate config.json")
-	}
-	if _, err := cf.Seek(0, 0); err != nil {
-		return errors.Wrap(err, "failed to seek to 0 in config.json")
-	}
-
-	// If we are creating LCOW make sure that spec.Windows is filled out before
-	// appending layer folders.
-	if m.Type == "lcow-layer" && spec.Windows == nil {
-		spec.Windows = &oci.Windows{
-			HyperV: &oci.WindowsHyperV{},
+		// If we are creating LCOW make sure that spec.Windows is filled out before
+		// appending layer folders.
+		if spec.Windows == nil {
+			spec.Windows = &oci.Windows{}
+		}
+		if spec.Windows.HyperV == nil {
+			spec.Windows.HyperV = &oci.WindowsHyperV{}
+		}
+	} else if spec.Windows.HyperV == nil {
+		// This is a Windows Argon make sure that we have a Root filled in.
+		if spec.Root == nil {
+			spec.Root = &oci.Root{}
 		}
 	}
 
@@ -326,6 +405,13 @@ func writeMountsToConfig(bundle string, mounts []*containerd_types.Mount) error 
 	spec.Windows.LayerFolders = append(spec.Windows.LayerFolders, parentLayerPaths...)
 	// Append the scratch
 	spec.Windows.LayerFolders = append(spec.Windows.LayerFolders, m.Source)
+
+	if err := cf.Truncate(0); err != nil {
+		return errors.Wrap(err, "failed to truncate config.json")
+	}
+	if _, err := cf.Seek(0, 0); err != nil {
+		return errors.Wrap(err, "failed to seek to 0 in config.json")
+	}
 
 	if err := json.NewEncoder(cf).Encode(spec); err != nil {
 		return errors.Wrap(err, "failed to write Mounts into config.json")
@@ -335,11 +421,24 @@ func writeMountsToConfig(bundle string, mounts []*containerd_types.Mount) error 
 
 // Create a new initial process and container with runhcs
 func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (*taskAPI.CreateTaskResponse, error) {
-	log.G(ctx).Infof("Create: %s", r.ID)
+	log.G(ctx).Debugf("Create: %s", r.ID)
 
 	// Hold the lock for the entire duration to avoid duplicate process creation.
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	_, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "create namespace")
+	}
+
+	if r.Options != nil {
+		v, err := typeurl.UnmarshalAny(r.Options)
+		if err != nil {
+			return nil, err
+		}
+		s.shimOpts = *v.(*options.Options)
+	}
 
 	if p := s.processes[r.ID]; p != nil {
 		return nil, errdefs.ToGRPCf(errdefs.ErrAlreadyExists, "process %s already exists", r.ID)
@@ -381,15 +480,91 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (*ta
 		}
 	}()
 
+	if s.shimOpts.Debug {
+		if s.debugLog == "" {
+			if s.shimOpts.DebugType == options.Options_FILE {
+				s.debugLog = filepath.Join(r.Bundle, fmt.Sprintf("runhcs-%s.log", r.ID))
+			} else {
+				logPath := safePipePrefix + fmt.Sprintf("runhcs-log-%s", r.ID)
+				l, err := winio.ListenPipe(logPath, nil)
+				if err != nil {
+					return nil, err
+				}
+				s.debugLog = logPath
+				s.debugListener = l
+
+				// Accept connections and forward all logs for each runhcs.exe
+				// invocation
+				go func() {
+					for {
+						c, err := s.debugListener.Accept()
+						if err != nil {
+							if err == winio.ErrPipeListenerClosed {
+								break
+							}
+							log.G(ctx).WithError(err).Debug("log accept failure")
+							// Logrus error locally?
+							continue
+						}
+						fields := map[string]interface{}{
+							"log-source": "runhcs",
+							"task-id":    r.ID,
+						}
+						go forwardRunhcsLogs(ctx, c, fields)
+					}
+				}()
+			}
+		}
+	}
+
 	pidfilePath := path.Join(r.Bundle, "runhcs-pidfile.pid")
 	copts := &runhcs.CreateOpts{
 		IO:      io,
 		PidFile: pidfilePath,
-		ShimLog: path.Join(r.Bundle, "runhcs-shim.log"),
-		VMLog:   path.Join(r.Bundle, "runhcs-vm-shim.log"),
 	}
+	rhcs := s.newRunhcs()
+	if rhcs.Debug {
+		if s.shimOpts.DebugType == options.Options_FILE {
+			copts.ShimLog = filepath.Join(r.Bundle, fmt.Sprintf("runhcs-shim-%s.log", r.ID))
+			copts.VMLog = filepath.Join(r.Bundle, fmt.Sprintf("runhcs-vmshim-%s.log", r.ID))
+		} else {
+			doForwardLogs := func(source, logPipeFmt string, opt *string) error {
+				pipeName := fmt.Sprintf(logPipeFmt, r.ID)
+				*opt = safePipePrefix + pipeName
+				l, err := winio.ListenPipe(*opt, nil)
+				if err != nil {
+					return err
+				}
+				go func() {
+					defer l.Close()
+					c, err := l.Accept()
+					if err != nil {
+						log.G(ctx).
+							WithField("task-id", r.ID).
+							WithError(err).
+							Errorf("failed to accept %s", pipeName)
+					} else {
+						fields := map[string]interface{}{
+							"log-source": source,
+							"task-id":    r.ID,
+						}
+						go forwardRunhcsLogs(ctx, c, fields)
+					}
+				}()
+				return nil
+			}
 
-	rhcs := newRunhcs(r.Bundle)
+			err = doForwardLogs("runhcs-shim", "runhcs-shim-log-%s", &copts.ShimLog)
+			if err != nil {
+				return nil, err
+			}
+
+			err = doForwardLogs("runhcs--vm-shim", "runhcs-vm-shim-log-%s", &copts.VMLog)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 	err = rhcs.Create(ctx, r.ID, r.Bundle, copts)
 	if err != nil {
 		return nil, err
@@ -425,7 +600,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (*ta
 
 // Start a process
 func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.StartResponse, error) {
-	log.G(ctx).Infof("Start: %s: %s", r.ID, r.ExecID)
+	log.G(ctx).Debugf("Start: %s: %s", r.ID, r.ExecID)
 	var p *process
 	var err error
 	if p, err = s.getProcess(r.ID, r.ExecID); err != nil {
@@ -438,7 +613,7 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.
 		return nil, errors.New("cannot start already started container or process")
 	}
 
-	rhcs := newRunhcs(p.bundle)
+	rhcs := s.newRunhcs()
 
 	// This is a start/exec
 	if r.ExecID != "" {
@@ -448,8 +623,45 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.
 		eopts := &runhcs.ExecOpts{
 			IO:      p.relay.io,
 			PidFile: pidfilePath,
-			ShimLog: path.Join(p.bundle, fmt.Sprintf("runhcs-%s-shim.log", execFmt)),
 			Detach:  true,
+		}
+
+		if rhcs.Debug {
+			if s.shimOpts.DebugType == options.Options_FILE {
+				eopts.ShimLog = filepath.Join(p.bundle, fmt.Sprintf("runhcs-shim-%s.log", execFmt))
+			} else {
+				doForwardLogs := func(source, pipeName string, opt *string) error {
+					*opt = safePipePrefix + pipeName
+					l, err := winio.ListenPipe(*opt, nil)
+					if err != nil {
+						return err
+					}
+					go func() {
+						defer l.Close()
+						c, err := l.Accept()
+						if err != nil {
+							log.G(ctx).
+								WithField("task-id", r.ID).
+								WithField("exec-id", r.ExecID).
+								WithError(err).
+								Errorf("failed to accept %s", pipeName)
+						} else {
+							fields := map[string]interface{}{
+								"log-source": source,
+								"task-id":    r.ID,
+								"exec-id":    r.ExecID,
+							}
+							go forwardRunhcsLogs(ctx, c, fields)
+						}
+					}()
+					return nil
+				}
+
+				err = doForwardLogs("runhcs-shim-exec", "runhcs-shim-log-"+execFmt, &eopts.ShimLog)
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
 
 		// ID here is the containerID to exec the process in.
@@ -470,7 +682,6 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to find exec process pid")
 		}
-		p.pid = uint32(pid)
 		go waitForProcess(ctx, p, proc, s)
 	} else {
 		if err := rhcs.Start(ctx, p.id); err != nil {
@@ -500,14 +711,15 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.
 			time.Sleep(1 * time.Second)
 		}
 	}
+	stat := p.stat()
 	return &taskAPI.StartResponse{
-		Pid: p.pid,
+		Pid: stat.pid,
 	}, nil
 }
 
 // Delete the initial process and container
 func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAPI.DeleteResponse, error) {
-	log.G(ctx).Infof("Delete: %s: %s", r.ID, r.ExecID)
+	log.G(ctx).Debugf("Delete: %s: %s", r.ID, r.ExecID)
 
 	var p *process
 	var err error
@@ -515,13 +727,15 @@ func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAP
 		return nil, err
 	}
 
-	rhs := newRunhcs(p.bundle)
-
-	dopts := &runhcs.DeleteOpts{
-		Force: true,
-	}
-	if err := rhs.Delete(ctx, p.id, dopts); err != nil {
-		return nil, errors.Wrapf(err, "failed to delete container: %s", p.id)
+	// This is a container
+	if p.cid == p.id {
+		rhs := s.newRunhcs()
+		dopts := &runhcs.DeleteOpts{
+			Force: true,
+		}
+		if err := rhs.Delete(ctx, p.id, dopts); err != nil {
+			return nil, errors.Wrapf(err, "failed to delete container: %s", p.id)
+		}
 	}
 
 	select {
@@ -539,25 +753,30 @@ func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAP
 	return &taskAPI.DeleteResponse{
 		ExitedAt:   exit.exitedAt,
 		ExitStatus: exit.exitStatus,
-		Pid:        p.pid,
+		Pid:        exit.pid,
 	}, nil
 }
 
 // Pids returns all pids inside the container
 func (s *service) Pids(ctx context.Context, r *taskAPI.PidsRequest) (*taskAPI.PidsResponse, error) {
+	log.G(ctx).Debugf("Pids: %s", r.ID)
+
 	return nil, errdefs.ErrNotImplemented
 }
 
 // Pause the container
 func (s *service) Pause(ctx context.Context, r *taskAPI.PauseRequest) (*ptypes.Empty, error) {
+	log.G(ctx).Debugf("Pause: %s", r.ID)
+
 	// TODO: Validate that 'id' is actually a valid parent container ID
-	if _, err := s.getProcess(r.ID, ""); err != nil {
+	var p *process
+	var err error
+	if p, err = s.getProcess(r.ID, ""); err != nil {
 		return nil, err
 	}
 
-	cmd := exec.Command(runhcsBinary, runhcsDebugLegacy, "pause", r.ID)
-	_, err := runCmd(ctx, cmd)
-	if err != nil {
+	rhcs := s.newRunhcs()
+	if err = rhcs.Pause(ctx, p.id); err != nil {
 		return nil, err
 	}
 
@@ -566,14 +785,17 @@ func (s *service) Pause(ctx context.Context, r *taskAPI.PauseRequest) (*ptypes.E
 
 // Resume the container
 func (s *service) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (*ptypes.Empty, error) {
+	log.G(ctx).Debugf("Resume: %s", r.ID)
+
 	// TODO: Validate that 'id' is actually a valid parent container ID
-	if _, err := s.getProcess(r.ID, ""); err != nil {
+	var p *process
+	var err error
+	if p, err = s.getProcess(r.ID, ""); err != nil {
 		return nil, err
 	}
 
-	cmd := exec.Command(runhcsBinary, runhcsDebugLegacy, "resume", r.ID)
-	_, err := runCmd(ctx, cmd)
-	if err != nil {
+	rhcs := s.newRunhcs()
+	if err = rhcs.Resume(ctx, p.id); err != nil {
 		return nil, err
 	}
 
@@ -582,12 +804,14 @@ func (s *service) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (*ptypes
 
 // Checkpoint the container
 func (s *service) Checkpoint(ctx context.Context, r *taskAPI.CheckpointTaskRequest) (*ptypes.Empty, error) {
+	log.G(ctx).Debugf("Checkpoint: %s", r.ID)
+
 	return nil, errdefs.ErrNotImplemented
 }
 
 // Kill a process with the provided signal
 func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (*ptypes.Empty, error) {
-	log.G(ctx).Infof("Kill: %s: %s", r.ID, r.ExecID)
+	log.G(ctx).Debugf("Kill: %s: %s", r.ID, r.ExecID)
 
 	var p *process
 	var err error
@@ -595,11 +819,10 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (*ptypes.Emp
 		return nil, err
 	}
 
-	// TODO: JTERRY75 runhcs needs r.Signal in string form
 	// TODO: JTERRY75 runhcs support for r.All?
-	rhcs := newRunhcs(p.bundle)
+	rhcs := s.newRunhcs()
 	if err = rhcs.Kill(ctx, p.id, strconv.FormatUint(uint64(r.Signal), 10)); err != nil {
-		if !strings.Contains(err.Error(), "container is not running") {
+		if !strings.Contains(err.Error(), "container is stopped") {
 			return nil, err
 		}
 	}
@@ -609,7 +832,7 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (*ptypes.Emp
 
 // Exec an additional process inside the container
 func (s *service) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (*ptypes.Empty, error) {
-	log.G(ctx).Infof("Exec: %s: %s", r.ID, r.ExecID)
+	log.G(ctx).Debugf("Exec: %s: %s", r.ID, r.ExecID)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -692,24 +915,20 @@ func (s *service) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (*pty
 
 // ResizePty of a process
 func (s *service) ResizePty(ctx context.Context, r *taskAPI.ResizePtyRequest) (*ptypes.Empty, error) {
+	log.G(ctx).Debugf("ResizePty: %s: %s", r.ID, r.ExecID)
+
 	var p *process
 	var err error
 	if p, err = s.getProcess(r.ID, r.ExecID); err != nil {
 		return nil, err
 	}
 
-	cmd := exec.Command(
-		runhcsBinary,
-		runhcsDebugLegacy,
-		"resize-tty",
-		p.cid,
-		"-p",
-		strconv.FormatUint(uint64(p.pid), 10),
-		strconv.FormatUint(uint64(r.Width), 10),
-		strconv.FormatUint(uint64(r.Height), 10))
-
-	_, err = runCmd(ctx, cmd)
-	if err != nil {
+	pid := int(p.stat().pid)
+	opts := runhcs.ResizeTTYOpts{
+		Pid: &pid,
+	}
+	rhcs := s.newRunhcs()
+	if err = rhcs.ResizeTTY(ctx, p.cid, uint16(r.Width), uint16(r.Height), &opts); err != nil {
 		return nil, err
 	}
 
@@ -718,6 +937,8 @@ func (s *service) ResizePty(ctx context.Context, r *taskAPI.ResizePtyRequest) (*
 
 // CloseIO of a process
 func (s *service) CloseIO(ctx context.Context, r *taskAPI.CloseIORequest) (*ptypes.Empty, error) {
+	log.G(ctx).Debugf("CloseIO: %s: %s", r.ID, r.ExecID)
+
 	var p *process
 	var err error
 	if p, err = s.getProcess(r.ID, r.ExecID); err != nil {
@@ -729,11 +950,15 @@ func (s *service) CloseIO(ctx context.Context, r *taskAPI.CloseIORequest) (*ptyp
 
 // Update a running container
 func (s *service) Update(ctx context.Context, r *taskAPI.UpdateTaskRequest) (*ptypes.Empty, error) {
+	log.G(ctx).Debugf("Update: %s", r.ID)
+
 	return nil, errdefs.ErrNotImplemented
 }
 
 // Wait for a process to exit
 func (s *service) Wait(ctx context.Context, r *taskAPI.WaitRequest) (*taskAPI.WaitResponse, error) {
+	log.G(ctx).Debugf("Wait: %s: %s", r.ID, r.ExecID)
+
 	var p *process
 	var err error
 	if p, err = s.getProcess(r.ID, r.ExecID); err != nil {
@@ -748,21 +973,35 @@ func (s *service) Wait(ctx context.Context, r *taskAPI.WaitRequest) (*taskAPI.Wa
 
 // Stats returns statistics about the running container
 func (s *service) Stats(ctx context.Context, r *taskAPI.StatsRequest) (*taskAPI.StatsResponse, error) {
+	log.G(ctx).Debugf("Stats: %s", r.ID)
+
 	return nil, errdefs.ErrNotImplemented
 }
 
 // Connect returns the runhcs shim information
 func (s *service) Connect(ctx context.Context, r *taskAPI.ConnectRequest) (*taskAPI.ConnectResponse, error) {
+	log.G(ctx).Debugf("Connect: %s", r.ID)
+
+	var taskpid uint32
+	p, _ := s.getProcess(r.ID, "")
+	if p != nil {
+		taskpid = p.stat().pid
+	}
+
 	return &taskAPI.ConnectResponse{
 		ShimPid: uint32(os.Getpid()),
-		TaskPid: s.processes[s.id].pid,
-		Version: runhcsVersion,
+		TaskPid: taskpid,
+		Version: runhcsShimVersion,
 	}, nil
 }
 
 // Shutdown stops this instance of the runhcs shim
 func (s *service) Shutdown(ctx context.Context, r *taskAPI.ShutdownRequest) (*ptypes.Empty, error) {
-	log.G(ctx).Infof("Shutdown: %s", r.ID)
+	log.G(ctx).Debugf("Shutdown: %s", r.ID)
+
+	if s.debugListener != nil {
+		s.debugListener.Close()
+	}
 
 	os.Exit(0)
 	return empty, nil

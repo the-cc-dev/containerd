@@ -21,12 +21,12 @@ import (
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/errdefs"
+	cni "github.com/containerd/go-cni"
 	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 
-	criconfig "github.com/containerd/cri/pkg/config"
 	sandboxstore "github.com/containerd/cri/pkg/store/sandbox"
 )
 
@@ -37,7 +37,10 @@ func (c *criService) PodSandboxStatus(ctx context.Context, r *runtime.PodSandbox
 		return nil, errors.Wrap(err, "an error occurred when try to find sandbox")
 	}
 
-	ip := c.getIP(sandbox)
+	ip, err := c.getIP(sandbox)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get sandbox ip")
+	}
 	status := toCRISandboxStatus(sandbox.Metadata, sandbox.Status.Get(), ip)
 	if !r.GetVerbose() {
 		return &runtime.PodSandboxStatusResponse{Status: status}, nil
@@ -55,21 +58,22 @@ func (c *criService) PodSandboxStatus(ctx context.Context, r *runtime.PodSandbox
 	}, nil
 }
 
-func (c *criService) getIP(sandbox sandboxstore.Sandbox) string {
+func (c *criService) getIP(sandbox sandboxstore.Sandbox) (string, error) {
 	config := sandbox.Config
 
 	if config.GetLinux().GetSecurityContext().GetNamespaceOptions().GetNetwork() == runtime.NamespaceMode_NODE {
 		// For sandboxes using the node network we are not
 		// responsible for reporting the IP.
-		return ""
+		return "", nil
 	}
 
-	// The network namespace has been closed.
-	if sandbox.NetNS == nil || sandbox.NetNS.Closed() {
-		return ""
+	if closed, err := sandbox.NetNS.Closed(); err != nil {
+		return "", errors.Wrap(err, "check network namespace closed")
+	} else if closed {
+		return "", nil
 	}
 
-	return sandbox.IP
+	return sandbox.IP, nil
 }
 
 // toCRISandboxStatus converts sandbox metadata into CRI pod sandbox status.
@@ -100,8 +104,9 @@ func toCRISandboxStatus(meta sandboxstore.Metadata, status sandboxstore.Status, 
 	}
 }
 
+// SandboxInfo is extra information for sandbox.
 // TODO (mikebrow): discuss predefining constants structures for some or all of these field names in CRI
-type sandboxInfo struct {
+type SandboxInfo struct {
 	Pid            uint32                    `json:"pid"`
 	Status         string                    `json:"processStatus"`
 	NetNSClosed    bool                      `json:"netNamespaceClosed"`
@@ -109,9 +114,11 @@ type sandboxInfo struct {
 	SnapshotKey    string                    `json:"snapshotKey"`
 	Snapshotter    string                    `json:"snapshotter"`
 	RuntimeHandler string                    `json:"runtimeHandler"`
-	Runtime        *criconfig.Runtime        `json:"runtime"`
+	RuntimeType    string                    `json:"runtimeType"`
+	RuntimeOptions interface{}               `json:"runtimeOptions"`
 	Config         *runtime.PodSandboxConfig `json:"config"`
 	RuntimeSpec    *runtimespec.Spec         `json:"runtimeSpec"`
+	CNIResult      *cni.CNIResult            `json:"cniResult"`
 }
 
 // toCRISandboxInfo converts internal container object information to CRI sandbox status response info map.
@@ -132,11 +139,12 @@ func toCRISandboxInfo(ctx context.Context, sandbox sandboxstore.Sandbox) (map[st
 		processStatus = taskStatus.Status
 	}
 
-	si := &sandboxInfo{
+	si := &SandboxInfo{
 		Pid:            sandbox.Status.Get().Pid,
 		RuntimeHandler: sandbox.RuntimeHandler,
 		Status:         string(processStatus),
 		Config:         sandbox.Config,
+		CNIResult:      sandbox.CNIResult,
 	}
 
 	if si.Status == "" {
@@ -145,9 +153,13 @@ func toCRISandboxInfo(ctx context.Context, sandbox sandboxstore.Sandbox) (map[st
 		si.Status = "deleted"
 	}
 
-	if sandbox.NetNSPath != "" {
+	if sandbox.NetNS != nil {
 		// Add network closed information if sandbox is not using host network.
-		si.NetNSClosed = (sandbox.NetNS == nil || sandbox.NetNS.Closed())
+		closed, err := sandbox.NetNS.Closed()
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to check network namespace closed")
+		}
+		si.NetNSClosed = closed
 	}
 
 	spec, err := container.Spec(ctx)
@@ -167,11 +179,12 @@ func toCRISandboxInfo(ctx context.Context, sandbox sandboxstore.Sandbox) (map[st
 	si.SnapshotKey = ctrInfo.SnapshotKey
 	si.Snapshotter = ctrInfo.Snapshotter
 
-	ociRuntime, err := getRuntimeConfigFromContainerInfo(ctrInfo)
+	runtimeOptions, err := getRuntimeOptions(ctrInfo)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get sandbox container runtime config")
+		return nil, errors.Wrap(err, "failed to get runtime options")
 	}
-	si.Runtime = &ociRuntime
+	si.RuntimeType = ctrInfo.Runtime.Name
+	si.RuntimeOptions = runtimeOptions
 
 	infoBytes, err := json.Marshal(si)
 	if err != nil {

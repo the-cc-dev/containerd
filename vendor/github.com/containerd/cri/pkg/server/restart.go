@@ -34,9 +34,9 @@ import (
 	"golang.org/x/net/context"
 	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 
+	"github.com/containerd/cri/pkg/netns"
 	cio "github.com/containerd/cri/pkg/server/io"
 	containerstore "github.com/containerd/cri/pkg/store/container"
-	imagestore "github.com/containerd/cri/pkg/store/image"
 	sandboxstore "github.com/containerd/cri/pkg/store/sandbox"
 )
 
@@ -96,7 +96,7 @@ func (c *criService) recover(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "failed to list images")
 	}
-	loadImages(ctx, c.imageStore, cImages, c.config.ContainerdConfig.Snapshotter)
+	c.loadImages(ctx, cImages)
 
 	// It's possible that containerd containers are deleted unexpectedly. In that case,
 	// we can't even get metadata, we should cleanup orphaned sandbox/container directories
@@ -136,8 +136,23 @@ func (c *criService) recover(ctx context.Context) error {
 	return nil
 }
 
+// loadContainerTimeout is the default timeout for loading a container/sandbox.
+// One container/sandbox hangs (e.g. containerd#2438) should not affect other
+// containers/sandboxes.
+// Most CRI container/sandbox related operations are per container, the ones
+// which handle multiple containers at a time are:
+// * ListPodSandboxes: Don't talk with containerd services.
+// * ListContainers: Don't talk with containerd services.
+// * ListContainerStats: Not in critical code path, a default timeout will
+// be applied at CRI level.
+// * Recovery logic: We should set a time for each container/sandbox recovery.
+// * Event monitor: We should set a timeout for each container/sandbox event handling.
+const loadContainerTimeout = 10 * time.Second
+
 // loadContainer loads container from containerd and status checkpoint.
 func (c *criService) loadContainer(ctx context.Context, cntr containerd.Container) (containerstore.Container, error) {
+	ctx, cancel := context.WithTimeout(ctx, loadContainerTimeout)
+	defer cancel()
 	id := cntr.ID()
 	containerDir := c.getContainerRootDir(id)
 	volatileContainerDir := c.getVolatileContainerRootDir(id)
@@ -290,9 +305,9 @@ const (
 // unknownContainerStatus returns the default container status when its status is unknown.
 func unknownContainerStatus() containerstore.Status {
 	return containerstore.Status{
-		CreatedAt:  time.Now().UnixNano(),
-		StartedAt:  time.Now().UnixNano(),
-		FinishedAt: time.Now().UnixNano(),
+		CreatedAt:  0,
+		StartedAt:  0,
+		FinishedAt: 0,
 		ExitCode:   unknownExitCode,
 		Reason:     unknownExitReason,
 	}
@@ -300,6 +315,8 @@ func unknownContainerStatus() containerstore.Status {
 
 // loadSandbox loads sandbox from containerd.
 func loadSandbox(ctx context.Context, cntr containerd.Container) (sandboxstore.Sandbox, error) {
+	ctx, cancel := context.WithTimeout(ctx, loadContainerTimeout)
+	defer cancel()
 	var sandbox sandboxstore.Sandbox
 	// Load sandbox metadata.
 	exts, err := cntr.Extensions(ctx)
@@ -378,14 +395,7 @@ func loadSandbox(ctx context.Context, cntr containerd.Container) (sandboxstore.S
 		// Don't need to load netns for host network sandbox.
 		return sandbox, nil
 	}
-	netNS, err := sandboxstore.LoadNetNS(meta.NetNSPath)
-	if err != nil {
-		if err != sandboxstore.ErrClosedNetNS {
-			return sandbox, errors.Wrapf(err, "failed to load netns %q", meta.NetNSPath)
-		}
-		netNS = nil
-	}
-	sandbox.NetNS = netNS
+	sandbox.NetNS = netns.LoadNetNS(meta.NetNSPath)
 
 	// It doesn't matter whether task is running or not. If it is running, sandbox
 	// status will be `READY`; if it is not running, sandbox status will be `NOT_READY`,
@@ -394,8 +404,8 @@ func loadSandbox(ctx context.Context, cntr containerd.Container) (sandboxstore.S
 }
 
 // loadImages loads images from containerd.
-func loadImages(ctx context.Context, store *imagestore.Store, cImages []containerd.Image,
-	snapshotter string) {
+func (c *criService) loadImages(ctx context.Context, cImages []containerd.Image) {
+	snapshotter := c.config.ContainerdConfig.Snapshotter
 	for _, i := range cImages {
 		ok, _, _, _, err := containerdimages.Check(ctx, i.ContentStore(), i.Target(), platforms.Default())
 		if err != nil {
@@ -416,7 +426,7 @@ func loadImages(ctx context.Context, store *imagestore.Store, cImages []containe
 			logrus.Warnf("The image %s is not unpacked.", i.Name())
 			// TODO(random-liu): Consider whether we should try unpack here.
 		}
-		if err := store.Update(ctx, i.Name()); err != nil {
+		if err := c.updateImage(ctx, i.Name()); err != nil {
 			logrus.WithError(err).Warnf("Failed to update reference for image %q", i.Name())
 			continue
 		}
